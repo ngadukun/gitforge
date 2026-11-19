@@ -287,7 +287,58 @@ export function readPack(pack) {
   return { version, count, objects };
 }
 
+// Adler-32 of `data` as the 4 big-endian bytes a zlib stream ends with
+// (deferred-mod blocks, the standard NMAX=5552 formulation).
+function adler32Trailer(data) {
+  let a = 1;
+  let b = 0;
+  let offset = 0;
+  while (offset < data.length) {
+    const blockEnd = Math.min(offset + 5552, data.length);
+    for (; offset < blockEnd; offset += 1) {
+      a += data[offset];
+      b += a;
+    }
+    a %= 65521;
+    b %= 65521;
+  }
+  return Buffer.from([(b >> 8) & 0xff, b & 0xff, (a >> 8) & 0xff, a & 0xff]);
+}
+
+// Inflate the stream starting at `offset`; returns {data, next} with `next`
+// the offset just past the stream's end. One inflate over the whole tail
+// yields the object (zlib stops at the stream's end and ignores what
+// follows); the exact end is then the first place the stream's own Adler-32
+// trailer appears where a fresh inflate of just that prefix returns the
+// same bytes — a chance match inside the compressed data fails that check
+// and the search moves on. When no candidate verifies (a corrupt stream),
+// the exact prefix search below runs instead, so bad packs fail as before.
 function inflateAt(buffer, offset, maxEnd) {
+  const end = maxEnd === undefined ? buffer.length : maxEnd;
+  let data;
+  try {
+    data = inflateSync(buffer.subarray(offset, end));
+  } catch {
+    return inflateAtSearch(buffer, offset, end);
+  }
+  const trailer = adler32Trailer(data);
+  let searchFrom = offset + 2;
+  for (;;) {
+    const at = buffer.indexOf(trailer, searchFrom);
+    if (at === -1 || at + 4 > end) return inflateAtSearch(buffer, offset, end);
+    try {
+      const check = inflateSync(buffer.subarray(offset, at + 4));
+      if (check.equals(data)) return { data, next: at + 4 };
+    } catch {
+      // A chance match inside the compressed bytes: keep looking.
+    }
+    searchFrom = at + 1;
+  }
+}
+
+// The exact-end search: grow a prefix until it inflates, then binary-search
+// the minimal succeeding prefix (any shorter one is a truncated stream).
+function inflateAtSearch(buffer, offset, maxEnd) {
   const end = maxEnd === undefined ? buffer.length : maxEnd;
   let lo = offset;
   let hi = Math.min(end, offset + 16);
@@ -390,6 +441,7 @@ export class Store {
   constructor() {
     this.repos = new Map(); // "owner/name" -> repo
     this.repoSeq = 1;
+    this.repoInstanceSeq = 1; // identity per repo instance (delete+recreate differs)
     this.objectSeq = 10000; // numeric ids for issues / pulls / comments
     this.timeSeq = 1700000000; // commit timestamps, deterministic per run
     this.requestSeq = 1;
@@ -416,6 +468,8 @@ export class Store {
     if (this.repos.has(key)) return { error: 'exists' };
     const repo = {
       id: this.repoSeq,
+      instance: this.repoInstanceSeq,
+      version: 0, // bumped on every git-visible mutation (objects/refs)
       nodeId: globalId('repo', key),
       owner,
       name,
@@ -434,6 +488,7 @@ export class Store {
       nextNumber: 1,
     };
     this.repoSeq += 1;
+    this.repoInstanceSeq += 1;
     this.repos.set(key, repo);
     return { repo };
   }
@@ -454,7 +509,10 @@ export class Store {
 
   putObject(repo, type, data) {
     const oid = hashObject(type, data);
-    if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
+    if (!repo.objects.has(oid)) {
+      repo.objects.set(oid, { type, data });
+      repo.version += 1;
+    }
     return oid;
   }
 
@@ -464,11 +522,12 @@ export class Store {
 
   setRef(repo, ref, oid) {
     if (!repo.refs.has(ref)) repo.refOrder.push(ref);
+    if (repo.refs.get(ref) !== oid) repo.version += 1;
     repo.refs.set(ref, oid);
   }
 
   deleteRef(repo, ref) {
-    repo.refs.delete(ref);
+    if (repo.refs.delete(ref)) repo.version += 1;
     repo.refOrder = repo.refOrder.filter((name) => name !== ref);
   }
 
@@ -650,8 +709,29 @@ export class Store {
 
   isAncestor(repo, ancestor, descendant) {
     if (ancestor === descendant) return true;
-    const walk = this.walk(repo, [descendant], {});
-    return walk.commits.has(ancestor);
+    // Reachability over the commit parent graph only, with an early exit:
+    // the full walk() would expand every reachable commit and flatten its
+    // tree, which makes a fast-forward check cost O(history) — the push
+    // workload checks a direct parent, so stop as soon as it is found.
+    // Semantics match walk(): tags are peeled to their target, and only a
+    // commit can be an ancestor (a tag oid is never in walk()'s commits).
+    const seen = new Set();
+    const stack = [descendant];
+    while (stack.length > 0) {
+      const oid = stack.pop();
+      if (seen.has(oid)) continue;
+      seen.add(oid);
+      const object = this.getObject(repo, oid);
+      if (object === null) continue;
+      if (object.type === 'tag') {
+        stack.push(parseTag(object.data).object);
+        continue;
+      }
+      if (object.type !== 'commit') continue;
+      if (oid === ancestor) return true;
+      for (const parent of parseCommit(object.data).parents) stack.push(parent);
+    }
+    return false;
   }
 
   // -- diff ------------------------------------------------------------------

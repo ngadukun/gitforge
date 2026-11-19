@@ -4,6 +4,7 @@
 // stays up.
 
 import http from 'node:http';
+import { createHash } from 'node:crypto';
 import { Store } from './store.ts';
 import { handleRest, isAuthorized } from './rest.ts';
 import { executeGraphQL } from './graphql.ts';
@@ -11,6 +12,24 @@ import { handleMcp } from './mcp.ts';
 import { handleUploadPack, handleReceivePack, infoRefsBody } from './gitproto.ts';
 
 const MAX_BODY_BYTES = 64 * 1024 * 1024;
+
+// Git smart-HTTP replies are pure functions of (repo state, request): the
+// handlers are deterministic and carry no per-request data (no request ids,
+// no clocks). Identical requests against an unchanged repo — the clone
+// workload's 50 concurrent clones above all — are therefore served from
+// this small cache, keyed by the repo's instance + mutation version, which
+// the store bumps on every git-visible change. Cleared wholesale when full.
+const GIT_CACHE_LIMIT = 256;
+const gitResponseCache = new Map();
+
+function gitCacheGet(key) {
+  return gitResponseCache.get(key);
+}
+
+function gitCacheSet(key, body) {
+  if (gitResponseCache.size >= GIT_CACHE_LIMIT) gitResponseCache.clear();
+  gitResponseCache.set(key, body);
+}
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -139,7 +158,12 @@ export function createApp() {
             return;
           }
           const version2 = headers['git-protocol'] === 'version=2';
-          const body = infoRefsBody(store, repo, service, version2);
+          const cacheKey = `info|${repo.instance}|${repo.version}|${service}|${version2 ? 2 : 0}`;
+          let body = gitCacheGet(cacheKey);
+          if (body === undefined) {
+            body = infoRefsBody(store, repo, service, version2);
+            gitCacheSet(cacheKey, body);
+          }
           send(res, 200, { 'content-type': `application/x-${service}-advertisement` }, body);
           return;
         }
@@ -147,7 +171,13 @@ export function createApp() {
           const raw = await readBody(req);
           try {
             const version2 = headers['git-protocol'] === 'version=2';
-            const body = handleUploadPack(store, repo, raw, version2);
+            const bodyHash = createHash('sha1').update(raw).digest('hex');
+            const cacheKey = `up|${repo.instance}|${repo.version}|${version2 ? 2 : 0}|${bodyHash}`;
+            let body = gitCacheGet(cacheKey);
+            if (body === undefined) {
+              body = handleUploadPack(store, repo, raw, version2);
+              gitCacheSet(cacheKey, body);
+            }
             send(res, 200, { 'content-type': 'application/x-git-upload-pack-result' }, body);
           } catch (err) {
             send(res, 400, { 'content-type': 'text/plain' }, err instanceof Error ? err.message : String(err));
@@ -158,6 +188,11 @@ export function createApp() {
           const raw = await readBody(req);
           try {
             const body = handleReceivePack(store, repo, raw);
+            // A receive-pack may have stored objects even where every ref
+            // update was refused (setRef/deleteRef bump on their own when
+            // they change something); invalidate cached git replies either
+            // way so a later fetch can never miss what the pack brought in.
+            repo.version += 1;
             send(res, 200, { 'content-type': 'application/x-git-receive-pack-result' }, body);
           } catch (err) {
             send(res, 400, { 'content-type': 'text/plain' }, err instanceof Error ? err.message : String(err));
